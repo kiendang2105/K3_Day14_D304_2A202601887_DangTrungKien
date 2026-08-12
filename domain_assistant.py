@@ -13,6 +13,8 @@ import math
 import os
 import re
 import time
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -266,6 +268,79 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Minimal Gemini REST adapter used only for answer generation."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        configured_models = os.getenv("GEMINI_MODELS", os.getenv("GEMINI_MODEL", ""))
+        self.models = tuple(model.strip() for model in configured_models.split(",") if model.strip())
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.models:
+            raise RuntimeError("GEMINI_MODEL or GEMINI_MODELS is missing from .env")
+        self.model = self.models[0]
+        self._next_model_index = 0
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
+        last_error: RuntimeError | None = None
+        for offset in range(len(self.models)):
+            model_index = (self._next_model_index + offset) % len(self.models)
+            model = self.models[model_index]
+            payload = {
+                "model": model,
+                "input": prompt,
+                "generation_config": {"temperature": 0, "max_output_tokens": self.max_output_tokens},
+            }
+            request = Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=60) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                    message = detail.get("error", {}).get("message", str(exc))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    message = str(exc)
+                if exc.code == 429:
+                    last_error = RuntimeError(f"{model} quota exceeded: {message}")
+                    continue
+                raise RuntimeError(f"Gemini API request failed ({exc.code}): {message}") from exc
+            self.model = model
+            self._next_model_index = (model_index + 1) % len(self.models)
+            return self._extract_answer(body)
+        raise last_error or RuntimeError("No Gemini model is available")
+
+    @staticmethod
+    def _extract_answer(body: dict[str, Any]) -> str:
+        try:
+            answer = body.get("output_text", "").strip()
+            if not answer:
+                for step in reversed(body["steps"]):
+                    if step.get("type") == "model_output":
+                        answer = step["content"][0]["text"].strip()
+                        break
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise RuntimeError("Gemini returned no text candidate") from exc
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def _default_generator() -> TextGenerator:
+    """Select Gemini when configured, otherwise preserve OpenAI compatibility."""
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        return GeminiGenerator()
+    return OpenAIGenerator()
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +374,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _default_generator(),
             top_k,
         )
 
